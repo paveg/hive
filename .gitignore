@@ -1,0 +1,17 @@
+# Rust
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Hive runtime data
+.hive/worktrees/
+.hive/logs/
+.hive/tasks.json
