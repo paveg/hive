@@ -12,6 +12,4 @@
 .DS_Store
 
 # Hive runtime data
-.hive/worktrees/
-.hive/logs/
-.hive/tasks.json
+.hive/
