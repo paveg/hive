@@ -701,9 +701,38 @@ impl App {
                     self.handle_agent_completed(&task_id)?;
                 }
                 AgentEvent::Failed { task_id, error } => {
-                    if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
-                        self.status_message =
-                            Some(format!("❌ Agent failed on '{}': {}", task.title, error));
+                    // Collect task info and update in a scope to end mutable borrow
+                    let task_info = if let Some(task) =
+                        self.tasks.iter_mut().find(|t| t.id == task_id)
+                    {
+                        // Revert status and clear agent assignment on failure
+                        let (new_status, cleared) = match task.status {
+                            TaskStatus::Planning => {
+                                task.planner = None;
+                                (TaskStatus::Todo, "planner")
+                            }
+                            TaskStatus::InProgress => {
+                                task.executor = None;
+                                (TaskStatus::PlanReview, "executor")
+                            }
+                            _ => (task.status, ""),
+                        };
+                        task.set_status(new_status);
+                        Some((task.title.clone(), new_status, cleared))
+                    } else {
+                        None
+                    };
+
+                    // Save and show message after mutable borrow ends
+                    if let Some((title, new_status, cleared)) = task_info {
+                        if let Err(e) = self.store.save(&self.tasks) {
+                            self.status_message = Some(format!("❌ Save error: {}", e));
+                        } else {
+                            self.status_message = Some(format!(
+                                "❌ Agent failed on '{}': {} (reverted to {}, {} cleared)",
+                                title, error, new_status.display_name(), cleared
+                            ));
+                        }
                     }
                 }
                 AgentEvent::Output { task_id, line } => {
