@@ -54,6 +54,12 @@ enum InputMode {
     ConfirmMerge,
 }
 
+/// Log entry for agent output
+struct LogEntry {
+    task_title: String,
+    line: String,
+}
+
 /// Application state
 struct App {
     /// Task store
@@ -96,6 +102,8 @@ struct App {
     diff_scroll: usize,
     /// Running agent count (cached)
     running_count: usize,
+    /// Agent log buffer (recent output lines)
+    agent_logs: std::collections::VecDeque<LogEntry>,
 }
 
 impl App {
@@ -132,6 +140,7 @@ impl App {
             diff_content: String::new(),
             diff_scroll: 0,
             running_count: 0,
+            agent_logs: std::collections::VecDeque::with_capacity(100),
         })
     }
 
@@ -781,15 +790,26 @@ impl App {
                     }
                 }
                 AgentEvent::Output { task_id, line } => {
-                    // Store last output line for the task
+                    // Store output in log buffer
                     if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
-                        // Update status message with last line (truncated safely for UTF-8)
+                        let task_title = task.title.clone();
+
+                        // Add to log buffer (keep max 100 entries)
+                        if self.agent_logs.len() >= 100 {
+                            self.agent_logs.pop_front();
+                        }
+                        self.agent_logs.push_back(LogEntry {
+                            task_title: task_title.clone(),
+                            line: line.clone(),
+                        });
+
+                        // Also update status message with truncated line
                         let truncated = if line.chars().count() > 60 {
                             format!("{}...", line.chars().take(57).collect::<String>())
                         } else {
                             line
                         };
-                        self.status_message = Some(format!("📝 {}: {}", task.title, truncated));
+                        self.status_message = Some(format!("📝 {}: {}", task_title, truncated));
                     }
                 }
             }
@@ -984,9 +1004,10 @@ fn ui(frame: &mut Frame, app: &App) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(3),  // Header
+            Constraint::Min(0),     // Kanban
+            Constraint::Length(8),  // Log panel
+            Constraint::Length(3),  // Footer
         ])
         .split(area);
 
@@ -1072,6 +1093,34 @@ fn ui(frame: &mut Frame, app: &App) {
         frame.render_widget(list, *col_area);
     }
 
+    // Log panel
+    let log_lines: Vec<Line> = app
+        .agent_logs
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|entry| {
+            Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", entry.task_title.chars().take(15).collect::<String>()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(&entry.line),
+            ])
+        })
+        .collect();
+
+    let log_panel = Paragraph::new(log_lines)
+        .block(
+            Block::default()
+                .title(" 📜 Agent Logs ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    frame.render_widget(log_panel, main_layout[2]);
+
     // Footer
     let footer_text = match &app.input_mode {
         InputMode::Normal => app
@@ -1084,7 +1133,7 @@ fn ui(frame: &mut Frame, app: &App) {
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::TOP));
-    frame.render_widget(footer, main_layout[2]);
+    frame.render_widget(footer, main_layout[3]);
 
     // Show popup in input mode
     match app.input_mode {
