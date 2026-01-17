@@ -104,7 +104,12 @@ struct App {
     running_count: usize,
     /// Agent log buffer (recent output lines)
     agent_logs: std::collections::VecDeque<LogEntry>,
+    /// Spinner animation frame
+    spinner_frame: usize,
 }
+
+/// Spinner animation frames
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 impl App {
     fn new() -> anyhow::Result<Self> {
@@ -141,6 +146,7 @@ impl App {
             diff_scroll: 0,
             running_count: 0,
             agent_logs: std::collections::VecDeque::with_capacity(100),
+            spinner_frame: 0,
         })
     }
 
@@ -543,6 +549,26 @@ impl App {
 
         let title = task.title.clone();
         let description = task.description.clone();
+
+        // Push branch first
+        self.status_message = Some(format!("Pushing branch '{}'...", branch));
+        let push_output = std::process::Command::new("git")
+            .args(["push", "-u", "origin", &branch])
+            .current_dir(&worktree)
+            .output();
+
+        match push_output {
+            Ok(result) if !result.status.success() => {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                self.status_message = Some(format!("❌ Push failed: {}", stderr.trim()));
+                return Ok(());
+            }
+            Err(e) => {
+                self.status_message = Some(format!("❌ Failed to run git push: {}", e));
+                return Ok(());
+            }
+            _ => {}
+        }
 
         // Create PR using gh command
         self.status_message = Some(format!("Creating PR for '{}'...", title));
@@ -980,6 +1006,8 @@ async fn main() -> anyhow::Result<()> {
         app.process_agent_events().await?;
         // Update running count
         app.update_running_count().await;
+        // Animate spinner
+        app.spinner_frame = (app.spinner_frame + 1) % SPINNER_FRAMES.len();
 
         terminal.draw(|frame| ui(frame, &app))?;
 
@@ -1124,6 +1152,14 @@ fn ui(frame: &mut Frame, app: &App) {
                 } else {
                     Style::default()
                 };
+                // Spinner for active tasks (Planning or InProgress)
+                let spinner = if task.status == TaskStatus::Planning
+                    || task.status == TaskStatus::InProgress
+                {
+                    format!("{} ", SPINNER_FRAMES[app.spinner_frame])
+                } else {
+                    String::new()
+                };
                 // Status icon (sub-status display for Progress column)
                 let status_icon = task.status.icon();
                 // Planner/Executor icon
@@ -1141,7 +1177,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 } else {
                     ""
                 };
-                ListItem::new(format!(" {} {}{}", status_icon, task.title, agent_icon)).style(style)
+                ListItem::new(format!(" {}{} {}{}", spinner, status_icon, task.title, agent_icon)).style(style)
             })
             .collect();
 
