@@ -242,45 +242,61 @@ impl App {
     /// Assign planner and start workflow
     fn assign_planner(&mut self) -> anyhow::Result<()> {
         let planner_name = self.selection_list[self.selected_index].clone();
+        let task_id = self
+            .selected_task()
+            .ok_or_else(|| anyhow::anyhow!("No task selected"))?
+            .id
+            .clone();
+        self.input_mode = InputMode::Normal;
+        self.start_planner_for_task(&task_id, &planner_name)
+    }
 
+    /// Start planning for a specific task with the given planner
+    fn start_planner_for_task(
+        &mut self,
+        task_id: &str,
+        planner_name: &str,
+    ) -> anyhow::Result<()> {
         // Get task info
-        let (task_id, task_title, task_description) = {
-            let task = self.selected_task().ok_or_else(|| anyhow::anyhow!("No task selected"))?;
-            (task.id.clone(), task.title.clone(), task.description.clone())
+        let (task_title, task_description) = {
+            let task = self
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
+            (task.title.clone(), task.description.clone())
         };
 
         // Run git validation
-        let validation = self.git_validator.validate_for_task_start(&task_id, "hive")?;
+        let validation = self.git_validator.validate_for_task_start(task_id, "hive")?;
         if !validation.is_valid {
-            self.input_mode = InputMode::Normal;
             self.status_message = Some(format!("❌ {}", validation.errors.join(", ")));
             return Ok(());
         }
 
         // Create worktree
-        let worktree_path = self.worktree_manager.create(&task_id)?;
-        let branch_name = self.worktree_manager.get_branch_name(&task_id);
+        let worktree_path = self.worktree_manager.create(task_id)?;
+        let branch_name = self.worktree_manager.get_branch_name(task_id);
 
         // Update task
-        if let Some(task) = self.selected_task_mut() {
-            task.assign_planner(&planner_name);
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.assign_planner(planner_name);
             task.branch = Some(branch_name.clone());
             task.worktree = Some(worktree_path.to_string_lossy().to_string());
             task.set_status(TaskStatus::Planning);
         }
 
         self.store.save(&self.tasks)?;
-        self.input_mode = InputMode::Normal;
 
         // Create planning prompt with plan file path
         let prompt = self
             .plan_manager
-            .create_planning_prompt(&task_id, &task_title, &task_description);
+            .create_planning_prompt(task_id, &task_title, &task_description);
 
         // Start agent in background
         self.start_agent(
-            task_id.clone(),
-            &planner_name,
+            task_id.to_string(),
+            planner_name,
             worktree_path,
             prompt,
         );
@@ -296,31 +312,54 @@ impl App {
     /// Assign executor and start implementation
     fn assign_executor(&mut self) -> anyhow::Result<()> {
         let executor_name = self.selection_list[self.selected_index].clone();
+        let task_id = self
+            .selected_task()
+            .ok_or_else(|| anyhow::anyhow!("No task selected"))?
+            .id
+            .clone();
+        self.input_mode = InputMode::Normal;
+        self.start_executor_for_task(&task_id, &executor_name)
+    }
 
+    /// Start execution for a specific task with the given executor
+    fn start_executor_for_task(
+        &mut self,
+        task_id: &str,
+        executor_name: &str,
+    ) -> anyhow::Result<()> {
         // Get task info
-        let (task_id, task_title, worktree_path) = {
-            let task = self.selected_task().ok_or_else(|| anyhow::anyhow!("No task selected"))?;
-            let worktree = task.worktree.clone().ok_or_else(|| anyhow::anyhow!("No worktree"))?;
-            (task.id.clone(), task.title.clone(), PathBuf::from(worktree))
+        let (task_title, worktree_path, branch) = {
+            let task = self
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .ok_or_else(|| anyhow::anyhow!("Task not found"))?;
+            let worktree = task
+                .worktree
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("No worktree"))?;
+            (
+                task.title.clone(),
+                PathBuf::from(worktree),
+                task.branch.clone().unwrap_or_default(),
+            )
         };
 
         // Create execution prompt
-        let prompt = self.plan_manager.create_execution_prompt(&task_id)?;
+        let prompt = self.plan_manager.create_execution_prompt(task_id)?;
 
         // Update task (worktree already created during Planner phase)
-        if let Some(task) = self.selected_task_mut() {
-            let branch = task.branch.clone().unwrap_or_default();
-            task.assign_executor(&executor_name, &branch);
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+            task.assign_executor(executor_name, &branch);
             task.set_status(TaskStatus::InProgress);
         }
 
         self.store.save(&self.tasks)?;
-        self.input_mode = InputMode::Normal;
 
         // Start agent in background
         self.start_agent(
-            task_id,
-            &executor_name,
+            task_id.to_string(),
+            executor_name,
             worktree_path,
             prompt,
         );
@@ -555,12 +594,16 @@ impl App {
             }
             InputMode::NewTaskDescription => {
                 let task = Task::new(&self.pending_title, &self.input_buffer);
+                let task_id = task.id.clone();
                 self.store.add(task)?;
                 self.tasks = self.store.load()?;
                 self.input_mode = InputMode::Normal;
                 self.input_buffer.clear();
                 self.pending_title.clear();
-                self.status_message = Some("Task created!".into());
+
+                // Auto-start planning with default planner
+                let default_planner = self.orchestrator.default_planner.clone();
+                self.start_planner_for_task(&task_id, &default_planner)?;
             }
             InputMode::SelectPlanner => {
                 self.assign_planner()?;
@@ -784,8 +827,11 @@ impl App {
                 if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
                     task.set_status(TaskStatus::PlanReview);
                     self.store.save(&self.tasks)?;
-                    self.status_message = Some(format!("✅ Plan completed: {}", title));
                 }
+
+                // Auto-start executor with default
+                let default_executor = self.orchestrator.default_executor.clone();
+                self.start_executor_for_task(task_id, &default_executor)?;
             }
             TaskStatus::InProgress => {
                 // Validate: Changes or commits must exist
