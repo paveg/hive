@@ -1044,7 +1044,15 @@ async fn main() -> anyhow::Result<()> {
                             _ => {}
                         },
                         InputMode::NewTaskTitle | InputMode::NewTaskDescription => match key.code {
-                            KeyCode::Enter => app.confirm_input()?,
+                            KeyCode::Enter => {
+                                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                                    // Ctrl+Enter: insert newline
+                                    app.input_buffer.push('\n');
+                                } else {
+                                    // Enter: confirm
+                                    app.confirm_input()?;
+                                }
+                            }
                             KeyCode::Esc => app.cancel_input(),
                             KeyCode::Backspace => app.handle_backspace(),
                             KeyCode::Char(c) => app.handle_input(c),
@@ -1242,24 +1250,42 @@ fn ui(frame: &mut Frame, app: &App) {
     // Show popup in input mode
     match app.input_mode {
         InputMode::NewTaskTitle | InputMode::NewTaskDescription => {
-            let popup_area = centered_rect(50, 20, area);
+            let popup_area = centered_rect(70, 30, area);
             frame.render_widget(Clear, popup_area);
 
-            let title = match app.input_mode {
-                InputMode::NewTaskTitle => "New Task - Title",
-                InputMode::NewTaskDescription => "New Task - Description",
-                _ => "",
+            let (title, help) = match app.input_mode {
+                InputMode::NewTaskTitle => (
+                    "New Task - Title",
+                    " Enter: confirm | Ctrl+Enter: newline | ESC: cancel ",
+                ),
+                InputMode::NewTaskDescription => (
+                    "New Task - Description",
+                    " Enter: confirm (skip if empty) | Ctrl+Enter: newline | ESC: cancel ",
+                ),
+                _ => ("", ""),
             };
+
+            // Split popup into input area and help text
+            let popup_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(3), Constraint::Length(1)])
+                .split(popup_area);
 
             let input = Paragraph::new(app.input_buffer.as_str())
                 .style(Style::default().fg(Color::Yellow))
+                .wrap(ratatui::widgets::Wrap { trim: false })
                 .block(
                     Block::default()
                         .title(title)
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(Color::Cyan)),
                 );
-            frame.render_widget(input, popup_area);
+            frame.render_widget(input, popup_layout[0]);
+
+            let help_text = Paragraph::new(help)
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(help_text, popup_layout[1]);
         }
         InputMode::SelectPlanner | InputMode::SelectExecutor => {
             let popup_area = centered_rect(50, 35, area);
