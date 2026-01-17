@@ -56,7 +56,7 @@ enum InputMode {
 
 /// Log entry for agent output
 struct LogEntry {
-    task_title: String,
+    task_id: String,
     line: String,
 }
 
@@ -516,42 +516,26 @@ impl App {
         Ok(())
     }
 
-    /// Create PR for selected task
-    fn create_pr(&mut self) -> anyhow::Result<()> {
-        let task = match self.selected_task() {
-            Some(t) => t,
-            None => {
-                self.status_message = Some("No task selected".into());
-                return Ok(());
-            }
+    /// Create PR for a specific task and return the PR URL
+    fn create_pr_for_task(&mut self, task_id: &str) -> Result<String, String> {
+        // Get task info (immutable borrow)
+        let task_info = self.tasks.iter().find(|t| t.id == task_id).map(|t| {
+            (
+                t.branch.clone(),
+                t.worktree.clone(),
+                t.title.clone(),
+                t.description.clone(),
+            )
+        });
+
+        let (branch, worktree, title, description) = match task_info {
+            Some((Some(b), Some(w), t, d)) => (b, w, t, d),
+            Some((None, _, _, _)) => return Err("No branch for this task".into()),
+            Some((_, None, _, _)) => return Err("No worktree for this task".into()),
+            None => return Err("Task not found".into()),
         };
-
-        if task.status != TaskStatus::Review {
-            self.status_message = Some("Task must be in Review status to create PR".into());
-            return Ok(());
-        }
-
-        let branch = match &task.branch {
-            Some(b) => b.clone(),
-            None => {
-                self.status_message = Some("No branch for this task".into());
-                return Ok(());
-            }
-        };
-
-        let worktree = match &task.worktree {
-            Some(w) => w.clone(),
-            None => {
-                self.status_message = Some("No worktree for this task".into());
-                return Ok(());
-            }
-        };
-
-        let title = task.title.clone();
-        let description = task.description.clone();
 
         // Push branch first
-        self.status_message = Some(format!("Pushing branch '{}'...", branch));
         let push_output = std::process::Command::new("git")
             .args(["push", "-u", "origin", &branch])
             .current_dir(&worktree)
@@ -560,19 +544,15 @@ impl App {
         match push_output {
             Ok(result) if !result.status.success() => {
                 let stderr = String::from_utf8_lossy(&result.stderr);
-                self.status_message = Some(format!("❌ Push failed: {}", stderr.trim()));
-                return Ok(());
+                return Err(format!("Push failed: {}", stderr.trim()));
             }
             Err(e) => {
-                self.status_message = Some(format!("❌ Failed to run git push: {}", e));
-                return Ok(());
+                return Err(format!("Failed to run git push: {}", e));
             }
             _ => {}
         }
 
         // Create PR using gh command
-        self.status_message = Some(format!("Creating PR for '{}'...", title));
-
         let pr_body = format!(
             "## Summary\n{}\n\n## Task\nCreated via Hive AI Agent Orchestration\n\n---\n🤖 Generated with Hive",
             if description.is_empty() { &title } else { &description }
@@ -587,14 +567,51 @@ impl App {
             Ok(result) => {
                 if result.status.success() {
                     let url = String::from_utf8_lossy(&result.stdout).trim().to_string();
-                    self.status_message = Some(format!("✅ PR created: {}", url));
+                    // Save PR URL to task
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                        task.pr_url = Some(url.clone());
+                        let _ = self.store.save(&self.tasks);
+                    }
+                    Ok(url)
                 } else {
                     let stderr = String::from_utf8_lossy(&result.stderr);
-                    self.status_message = Some(format!("❌ PR failed: {}", stderr.trim()));
+                    Err(format!("PR failed: {}", stderr.trim()))
                 }
             }
+            Err(e) => Err(format!("Failed to run gh: {}", e)),
+        }
+    }
+
+    /// Create PR for selected task (key binding 'p')
+    fn create_pr(&mut self) -> anyhow::Result<()> {
+        let task = match self.selected_task() {
+            Some(t) => t,
+            None => {
+                self.status_message = Some("No task selected".into());
+                return Ok(());
+            }
+        };
+
+        if task.status != TaskStatus::Review {
+            self.status_message = Some("Task must be in Review status to create PR".into());
+            return Ok(());
+        }
+
+        // Check if PR already exists
+        if task.pr_url.is_some() {
+            self.status_message = Some("PR already exists for this task".into());
+            return Ok(());
+        }
+
+        let task_id = task.id.clone();
+        self.status_message = Some("Creating PR...".into());
+
+        match self.create_pr_for_task(&task_id) {
+            Ok(url) => {
+                self.status_message = Some(format!("✅ PR created: {}", url));
+            }
             Err(e) => {
-                self.status_message = Some(format!("❌ Failed to run gh: {}", e));
+                self.status_message = Some(format!("❌ {}", e));
             }
         }
 
@@ -882,25 +899,29 @@ impl App {
                 }
                 AgentEvent::Output { task_id, line } => {
                     // Store output in log buffer
-                    if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
-                        let task_title = task.title.clone();
+                    let task_title = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == task_id)
+                        .map(|t| t.title.clone());
 
-                        // Add to log buffer (keep max 100 entries)
-                        if self.agent_logs.len() >= 100 {
-                            self.agent_logs.pop_front();
-                        }
-                        self.agent_logs.push_back(LogEntry {
-                            task_title: task_title.clone(),
-                            line: line.clone(),
-                        });
+                    // Add to log buffer (keep max 100 entries)
+                    if self.agent_logs.len() >= 100 {
+                        self.agent_logs.pop_front();
+                    }
+                    self.agent_logs.push_back(LogEntry {
+                        task_id: task_id.clone(),
+                        line: line.clone(),
+                    });
 
-                        // Also update status message with truncated line
+                    // Also update status message with truncated line
+                    if let Some(title) = task_title {
                         let truncated = if line.chars().count() > 60 {
                             format!("{}...", line.chars().take(57).collect::<String>())
                         } else {
                             line
                         };
-                        self.status_message = Some(format!("📝 {}: {}", task_title, truncated));
+                        self.status_message = Some(format!("📝 {}: {}", title, truncated));
                     }
                 }
             }
@@ -965,13 +986,30 @@ impl App {
                     if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
                         task.set_status(TaskStatus::Review);
                         self.store.save(&self.tasks)?;
+                    }
 
-                        let msg = if has_changes && !has_commits {
-                            format!("✅ Implementation completed (uncommitted): {}", title)
-                        } else {
-                            format!("✅ Implementation completed: {}", title)
-                        };
-                        self.status_message = Some(msg);
+                    // Auto-create PR if commits exist (not just uncommitted changes)
+                    if has_commits {
+                        match self.create_pr_for_task(task_id) {
+                            Ok(url) => {
+                                self.status_message = Some(format!(
+                                    "✅ Implementation completed & PR created: {}",
+                                    url
+                                ));
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!(
+                                    "✅ Implementation completed: {} (PR failed: {})",
+                                    title, e
+                                ));
+                            }
+                        }
+                    } else {
+                        // Only uncommitted changes - can't create PR yet
+                        self.status_message = Some(format!(
+                            "✅ Implementation completed (uncommitted): {}",
+                            title
+                        ));
                     }
                 } else {
                     self.status_message = Some(format!(
@@ -1213,9 +1251,12 @@ fn ui(frame: &mut Frame, app: &App) {
         .take(6)
         .rev()
         .map(|entry| {
+            // Show short task ID (e.g., "task-8f5b" -> "8f5b")
+            let short_id = entry.task_id.strip_prefix("task-").unwrap_or(&entry.task_id);
+            let short_id = short_id.chars().take(8).collect::<String>();
             Line::from(vec![
                 Span::styled(
-                    format!("[{}] ", entry.task_title.chars().take(15).collect::<String>()),
+                    format!("[{}] ", short_id),
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::raw(&entry.line),
@@ -1368,6 +1409,12 @@ fn ui(frame: &mut Frame, app: &App) {
                     lines.push(Line::from(vec![
                         Span::styled("Worktree: ", Style::default().fg(Color::Gray)),
                         Span::styled(worktree, Style::default().fg(Color::Blue)),
+                    ]));
+                }
+                if let Some(pr_url) = &task.pr_url {
+                    lines.push(Line::from(vec![
+                        Span::styled("PR: ", Style::default().fg(Color::Gray)),
+                        Span::styled(pr_url, Style::default().fg(Color::LightCyan)),
                     ]));
                 }
                 lines.push(Line::from(""));

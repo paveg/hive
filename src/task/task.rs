@@ -89,6 +89,8 @@ pub struct Task {
     pub completed_at: Option<DateTime<Utc>>,
     /// Log file path
     pub output_log: Option<String>,
+    /// Pull request URL
+    pub pr_url: Option<String>,
 }
 
 impl Task {
@@ -109,6 +111,7 @@ impl Task {
             started_at: None,
             completed_at: None,
             output_log: None,
+            pr_url: None,
         }
     }
 
