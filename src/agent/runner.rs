@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-/// エージェントの設定
+/// Agent configuration
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub name: String,
@@ -16,7 +16,7 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    /// Claude Code の設定
+    /// Claude Code configuration
     pub fn claude() -> Self {
         Self {
             name: "claude".into(),
@@ -25,7 +25,7 @@ impl AgentConfig {
         }
     }
 
-    /// Gemini CLI の設定
+    /// Gemini CLI configuration
     pub fn gemini() -> Self {
         Self {
             name: "gemini".into(),
@@ -34,7 +34,7 @@ impl AgentConfig {
         }
     }
 
-    /// Codex の設定
+    /// Codex configuration
     pub fn codex() -> Self {
         Self {
             name: "codex".into(),
@@ -43,7 +43,7 @@ impl AgentConfig {
         }
     }
 
-    /// 名前から設定を取得
+    /// Get configuration by name
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "claude" => Some(Self::claude()),
@@ -53,22 +53,25 @@ impl AgentConfig {
         }
     }
 
-    /// 利用可能なエージェント一覧
+    /// Get list of available agents
+    #[allow(dead_code)]
     pub fn available_agents() -> Vec<&'static str> {
         vec!["claude", "gemini", "codex"]
     }
 }
 
-/// エージェントの実行状態
+/// Agent execution status
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStatus {
+    #[allow(dead_code)]
     Idle,
     Running,
     Completed,
     Failed(String),
 }
 
-/// 実行中のエージェント情報
+/// Running agent information
+#[allow(dead_code)]
 pub struct RunningAgent {
     pub task_id: String,
     pub config: AgentConfig,
@@ -77,11 +80,11 @@ pub struct RunningAgent {
     child: Option<Child>,
 }
 
-/// エージェント実行を管理
+/// Agent execution manager
 pub struct AgentRunner {
-    /// 実行中のエージェント (task_id -> RunningAgent)
+    /// Running agents (task_id -> RunningAgent)
     pub agents: HashMap<String, RunningAgent>,
-    /// ログディレクトリ
+    /// Log directory
     log_dir: PathBuf,
 }
 
@@ -96,7 +99,7 @@ impl AgentRunner {
         }
     }
 
-    /// エージェントを起動
+    /// Start agent
     pub async fn start(
         &mut self,
         task_id: &str,
@@ -104,14 +107,14 @@ impl AgentRunner {
         working_dir: PathBuf,
         prompt: &str,
     ) -> Result<mpsc::Receiver<String>> {
-        // 出力を受け取るチャンネル
+        // Channel to receive output
         let (tx, rx) = mpsc::channel::<String>(100);
 
-        // プロンプトを引数に追加
+        // Add prompt to arguments
         let mut args = config.args.clone();
         args.push(prompt.to_string());
 
-        // プロセス起動
+        // Start process
         let mut child = Command::new(&config.command)
             .args(&args)
             .current_dir(&working_dir)
@@ -120,10 +123,10 @@ impl AgentRunner {
             .spawn()
             .context(format!("Failed to start {}", config.name))?;
 
-        // stdout を非同期で読み取り
+        // Read stdout asynchronously
         if let Some(stdout) = child.stdout.take() {
             let tx_clone = tx.clone();
-            let task_id_clone = task_id.to_string();
+            let _task_id_clone = task_id.to_string();
             let log_path = self.log_dir.join(format!("{}.log", task_id));
 
             tokio::spawn(async move {
@@ -137,12 +140,12 @@ impl AgentRunner {
                     .ok();
 
                 while let Ok(Some(line)) = lines.next_line().await {
-                    // ログファイルに書き込み
+                    // Write to log file
                     if let Some(ref mut file) = log_file {
                         use tokio::io::AsyncWriteExt;
                         let _ = file.write_all(format!("{}\n", line).as_bytes()).await;
                     }
-                    // チャンネルに送信
+                    // Send to channel
                     if tx_clone.send(line).await.is_err() {
                         break;
                     }
@@ -151,7 +154,7 @@ impl AgentRunner {
             });
         }
 
-        // stderr も同様に処理
+        // Handle stderr similarly
         if let Some(stderr) = child.stderr.take() {
             let tx_clone = tx;
             tokio::spawn(async move {
@@ -163,7 +166,7 @@ impl AgentRunner {
             });
         }
 
-        // 実行中エージェントを登録
+        // Register running agent
         let running = RunningAgent {
             task_id: task_id.to_string(),
             config,
@@ -176,7 +179,7 @@ impl AgentRunner {
         Ok(rx)
     }
 
-    /// エージェントを停止
+    /// Stop agent
     pub async fn stop(&mut self, task_id: &str) -> Result<()> {
         if let Some(agent) = self.agents.get_mut(task_id) {
             if let Some(mut child) = agent.child.take() {
@@ -187,12 +190,13 @@ impl AgentRunner {
         Ok(())
     }
 
-    /// エージェントの状態を取得
+    /// Get agent status
+    #[allow(dead_code)]
     pub fn get_status(&self, task_id: &str) -> Option<&AgentStatus> {
         self.agents.get(task_id).map(|a| &a.status)
     }
 
-    /// 実行中のエージェント数
+    /// Get count of running agents
     pub fn running_count(&self) -> usize {
         self.agents
             .values()
@@ -200,7 +204,8 @@ impl AgentRunner {
             .count()
     }
 
-    /// 完了をチェックして状態を更新
+    /// Check completion and update status
+    #[allow(dead_code)]
     pub async fn check_completion(&mut self) {
         for agent in self.agents.values_mut() {
             if agent.status == AgentStatus::Running {
@@ -214,7 +219,7 @@ impl AgentRunner {
                             };
                             agent.child = None;
                         }
-                        Ok(None) => {} // まだ実行中
+                        Ok(None) => {} // Still running
                         Err(e) => {
                             agent.status = AgentStatus::Failed(e.to_string());
                             agent.child = None;
@@ -223,5 +228,32 @@ impl AgentRunner {
                 }
             }
         }
+    }
+
+    /// Check completion for specific task (sync version)
+    pub fn check_task_completion(&mut self, task_id: &str) -> Option<AgentStatus> {
+        if let Some(agent) = self.agents.get_mut(task_id) {
+            if agent.status == AgentStatus::Running {
+                if let Some(ref mut child) = agent.child {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            agent.status = if status.success() {
+                                AgentStatus::Completed
+                            } else {
+                                AgentStatus::Failed(format!("Exit code: {:?}", status.code()))
+                            };
+                            agent.child = None;
+                        }
+                        Ok(None) => {} // Still running
+                        Err(e) => {
+                            agent.status = AgentStatus::Failed(e.to_string());
+                            agent.child = None;
+                        }
+                    }
+                }
+            }
+            return Some(agent.status.clone());
+        }
+        None
     }
 }

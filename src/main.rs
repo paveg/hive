@@ -4,6 +4,9 @@ mod task;
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -14,55 +17,99 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
+use tokio::sync::mpsc;
 
-use agent::AgentConfig;
-use git::WorktreeManager;
+use agent::{AgentRunner, AgentStatus, OrchestratorConfig, PlanManager};
+use git::{GitValidator, WorktreeManager, WorktreeValidator};
 use task::{Task, TaskStatus, TaskStore};
 
-/// 入力モード
+/// Events from agents
+#[derive(Debug, Clone)]
+enum AgentEvent {
+    /// Task completed
+    Completed { task_id: String },
+    /// Task failed
+    Failed { task_id: String, error: String },
+    /// Output line
+    Output { task_id: String, line: String },
+}
+
+/// Input mode
 #[derive(Debug, Clone, PartialEq)]
 enum InputMode {
     Normal,
-    /// タスク作成中 (タイトル入力)
+    /// Creating task (entering title)
     NewTaskTitle,
-    /// タスク作成中 (説明入力)
+    /// Creating task (entering description)
     NewTaskDescription,
-    /// エージェント選択中
-    SelectAgent,
+    /// Selecting planner
+    SelectPlanner,
+    /// Selecting executor
+    SelectExecutor,
+    /// Viewing task details
+    TaskDetail,
+    /// Viewing diff
+    ViewDiff,
+    /// Confirming merge
+    ConfirmMerge,
 }
 
-/// アプリケーションの状態
+/// Application state
 struct App {
-    /// タスクストア
+    /// Task store
     store: TaskStore,
-    /// 全タスク
+    /// All tasks
     tasks: Vec<Task>,
-    /// 現在選択中のカラム
+    /// Currently selected column
     selected_column: usize,
-    /// 各カラムで選択中のタスクインデックス
+    /// Selected task index for each column
     selected_task: [usize; 4],
-    /// 入力モード
+    /// Input mode
     input_mode: InputMode,
-    /// 入力中のテキスト
+    /// Input buffer
     input_buffer: String,
-    /// 作成中のタスクタイトル（一時保存）
+    /// Pending task title (temporary storage)
     pending_title: String,
-    /// ステータスメッセージ
+    /// Status message
     status_message: Option<String>,
-    /// Worktree マネージャー
+    /// Worktree manager
     worktree_manager: WorktreeManager,
-    /// エージェント選択リスト
-    agent_list: Vec<&'static str>,
-    /// 選択中のエージェントインデックス
-    selected_agent: usize,
+    /// Git validator
+    git_validator: GitValidator,
+    /// Orchestrator config
+    orchestrator: OrchestratorConfig,
+    /// Plan manager
+    plan_manager: PlanManager,
+    /// Selection list (shared for Planner/Executor)
+    selection_list: Vec<String>,
+    /// Selected index
+    selected_index: usize,
+    /// Agent runner (shared)
+    agent_runner: Arc<Mutex<AgentRunner>>,
+    /// Agent event receiver
+    agent_event_rx: mpsc::Receiver<AgentEvent>,
+    /// Agent event sender (for cloning)
+    agent_event_tx: mpsc::Sender<AgentEvent>,
+    /// Diff content (for ViewDiff mode)
+    diff_content: String,
+    /// Scroll offset for diff view
+    diff_scroll: usize,
+    /// Running agent count (cached)
+    running_count: usize,
 }
 
 impl App {
     fn new() -> anyhow::Result<Self> {
+        let repo_root = PathBuf::from(".");
         let hive_dir = PathBuf::from(".hive");
-        let store = TaskStore::new(".")?;
+        let store = TaskStore::new(&repo_root)?;
         let tasks = store.load()?;
-        let worktree_manager = WorktreeManager::new(PathBuf::from("."), hive_dir);
+        let worktree_manager = WorktreeManager::new(repo_root.clone(), hive_dir.clone());
+        let git_validator = GitValidator::new(repo_root);
+        let orchestrator = OrchestratorConfig::load(&hive_dir).unwrap_or_default();
+        let plan_manager = PlanManager::new(hive_dir.clone());
+        let agent_runner = Arc::new(Mutex::new(AgentRunner::new(hive_dir)));
+        let (agent_event_tx, agent_event_rx) = mpsc::channel(100);
 
         Ok(Self {
             store,
@@ -74,42 +121,41 @@ impl App {
             pending_title: String::new(),
             status_message: None,
             worktree_manager,
-            agent_list: AgentConfig::available_agents(),
-            selected_agent: 0,
+            git_validator,
+            orchestrator,
+            plan_manager,
+            selection_list: vec![],
+            selected_index: 0,
+            agent_runner,
+            agent_event_rx,
+            agent_event_tx,
+            diff_content: String::new(),
+            diff_scroll: 0,
+            running_count: 0,
         })
     }
 
-    /// 指定カラムのタスクを取得
+    /// Get tasks in specified column
     fn tasks_in_column(&self, column: usize) -> Vec<&Task> {
-        let status = match column {
-            0 => TaskStatus::Todo,
-            1 => TaskStatus::InProgress,
-            2 => TaskStatus::Review,
-            3 => TaskStatus::Done,
-            _ => return vec![],
-        };
-        self.tasks.iter().filter(|t| t.status == status).collect()
+        self.tasks
+            .iter()
+            .filter(|t| t.status.to_column_index() == Some(column))
+            .collect()
     }
 
-    /// 現在選択中のタスクを取得
+    /// Get currently selected task
     fn selected_task(&self) -> Option<&Task> {
         let tasks = self.tasks_in_column(self.selected_column);
         tasks.get(self.selected_task[self.selected_column]).copied()
     }
 
-    /// 現在選択中のタスクを可変で取得
+    /// Get currently selected task (mutable)
     fn selected_task_mut(&mut self) -> Option<&mut Task> {
-        let status = match self.selected_column {
-            0 => TaskStatus::Todo,
-            1 => TaskStatus::InProgress,
-            2 => TaskStatus::Review,
-            3 => TaskStatus::Done,
-            _ => return None,
-        };
-        let idx = self.selected_task[self.selected_column];
+        let column = self.selected_column;
+        let idx = self.selected_task[column];
         self.tasks
             .iter_mut()
-            .filter(|t| t.status == status)
+            .filter(|t| t.status.to_column_index() == Some(column))
             .nth(idx)
     }
 
@@ -142,7 +188,7 @@ impl App {
         }
     }
 
-    /// 選択インデックスを範囲内に収める
+    /// Clamp selection index within range
     fn clamp_selection(&mut self) {
         let col = self.selected_column;
         let count = self.tasks_in_column(col).len();
@@ -153,119 +199,348 @@ impl App {
         }
     }
 
-    /// タスク追加開始
+    /// Start new task creation
     fn start_new_task(&mut self) {
         self.input_mode = InputMode::NewTaskTitle;
         self.input_buffer.clear();
         self.status_message = Some("Enter task title (ESC to cancel)".into());
     }
 
-    /// エージェント選択開始
+    /// Start agent selection (select Planner/Executor based on status)
     fn start_assign_agent(&mut self) {
-        if self.selected_task().is_some() {
-            self.input_mode = InputMode::SelectAgent;
-            self.selected_agent = 0;
-            self.status_message = Some("Select agent (Enter to confirm, ESC to cancel)".into());
+        if let Some(task) = self.selected_task() {
+            match task.status {
+                TaskStatus::Todo => {
+                    // Planner選択
+                    self.selection_list = self.orchestrator.available_planners()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    self.selected_index = 0;
+                    self.input_mode = InputMode::SelectPlanner;
+                    self.status_message = Some("Select Planner (Enter to confirm, ESC to cancel)".into());
+                }
+                TaskStatus::PlanReview => {
+                    // Executor選択
+                    self.selection_list = self.orchestrator.available_executors()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    self.selected_index = 0;
+                    self.input_mode = InputMode::SelectExecutor;
+                    self.status_message = Some("Select Executor (Enter to confirm, ESC to cancel)".into());
+                }
+                _ => {
+                    self.status_message = Some("Cannot assign agent in this status".into());
+                }
+            }
         } else {
             self.status_message = Some("No task selected".into());
         }
     }
 
-    /// エージェントをアサインしてworktreeを作成
-    fn assign_agent(&mut self) -> anyhow::Result<()> {
-        let agent_name = self.agent_list[self.selected_agent];
+    /// Assign planner and start workflow
+    fn assign_planner(&mut self) -> anyhow::Result<()> {
+        let planner_name = self.selection_list[self.selected_index].clone();
 
-        // タスク情報を取得
-        let (task_id, task_title) = {
+        // Get task info
+        let (task_id, task_title, task_description) = {
             let task = self.selected_task().ok_or_else(|| anyhow::anyhow!("No task selected"))?;
-            (task.id.clone(), task.title.clone())
+            (task.id.clone(), task.title.clone(), task.description.clone())
         };
 
-        // Worktree を作成
+        // Run git validation
+        let validation = self.git_validator.validate_for_task_start(&task_id, "hive")?;
+        if !validation.is_valid {
+            self.input_mode = InputMode::Normal;
+            self.status_message = Some(format!("❌ {}", validation.errors.join(", ")));
+            return Ok(());
+        }
+
+        // Create worktree
         let worktree_path = self.worktree_manager.create(&task_id)?;
         let branch_name = self.worktree_manager.get_branch_name(&task_id);
 
-        // タスクを更新
+        // Update task
         if let Some(task) = self.selected_task_mut() {
-            task.agent = Some(agent_name.to_string());
+            task.assign_planner(&planner_name);
             task.branch = Some(branch_name.clone());
             task.worktree = Some(worktree_path.to_string_lossy().to_string());
-            task.set_status(TaskStatus::InProgress);
+            task.set_status(TaskStatus::Planning);
         }
 
         self.store.save(&self.tasks)?;
         self.input_mode = InputMode::Normal;
+
+        // Create planning prompt
+        let prompt = self.plan_manager.create_planning_prompt(&task_title, &task_description);
+
+        // Start agent in background
+        self.start_agent(
+            task_id.clone(),
+            &planner_name,
+            worktree_path,
+            prompt,
+        );
+
         self.status_message = Some(format!(
-            "Assigned {} to '{}' (branch: {})",
-            agent_name, task_title, branch_name
+            "🧠 Planner '{}' started for '{}' (branch: {})",
+            planner_name, task_title, branch_name
         ));
 
         Ok(())
     }
 
-    /// タスクを次のステータスに移動
-    fn move_task_forward(&mut self) -> anyhow::Result<()> {
+    /// Assign executor and start implementation
+    fn assign_executor(&mut self) -> anyhow::Result<()> {
+        let executor_name = self.selection_list[self.selected_index].clone();
+
+        // Get task info
+        let (task_id, task_title, worktree_path) = {
+            let task = self.selected_task().ok_or_else(|| anyhow::anyhow!("No task selected"))?;
+            let worktree = task.worktree.clone().ok_or_else(|| anyhow::anyhow!("No worktree"))?;
+            (task.id.clone(), task.title.clone(), PathBuf::from(worktree))
+        };
+
+        // Create execution prompt
+        let prompt = self.plan_manager.create_execution_prompt(&task_id)?;
+
+        // Update task (worktree already created during Planner phase)
         if let Some(task) = self.selected_task_mut() {
-            let new_status = match task.status {
-                TaskStatus::Todo => TaskStatus::InProgress,
-                TaskStatus::InProgress => TaskStatus::Review,
-                TaskStatus::Review => TaskStatus::Done,
-                TaskStatus::Done => return Ok(()),
-                TaskStatus::Cancelled => return Ok(()),
+            let branch = task.branch.clone().unwrap_or_default();
+            task.assign_executor(&executor_name, &branch);
+            task.set_status(TaskStatus::InProgress);
+        }
+
+        self.store.save(&self.tasks)?;
+        self.input_mode = InputMode::Normal;
+
+        // Start agent in background
+        self.start_agent(
+            task_id,
+            &executor_name,
+            worktree_path,
+            prompt,
+        );
+
+        self.status_message = Some(format!(
+            "🔨 Executor '{}' started for '{}'",
+            executor_name, task_title
+        ));
+
+        Ok(())
+    }
+
+    /// Move task to next status (with strict validation)
+    fn move_task_forward(&mut self) -> anyhow::Result<()> {
+        // First validate in read-only mode
+        let advance_result = {
+            let task = match self.selected_task() {
+                Some(t) => t,
+                None => return Ok(()),
             };
-            task.set_status(new_status);
-            self.store.save(&self.tasks)?;
-            self.status_message = Some(format!("Moved to {}", new_status.display_name()));
-            self.clamp_selection();
+
+            match task.can_advance() {
+                Ok(new_status) => {
+                    // For Planning → PlanReview, check if plan file exists
+                    if task.status == TaskStatus::Planning {
+                        if !self.plan_manager.plan_file_exists(&task.id) {
+                            return Ok(self.status_message = Some("Plan has not been created".into()));
+                        }
+                    }
+                    Ok(new_status)
+                }
+                Err(msg) => Err(msg),
+            }
+        };
+
+        // Update if validation succeeded
+        match advance_result {
+            Ok(new_status) => {
+                if let Some(task) = self.selected_task_mut() {
+                    task.set_status(new_status);
+                    self.store.save(&self.tasks)?;
+                    self.status_message = Some(format!("Moved to {}", new_status.display_name()));
+                    self.clamp_selection();
+                }
+            }
+            Err(msg) => {
+                self.status_message = Some(msg.to_string());
+            }
         }
         Ok(())
     }
 
-    /// タスクを前のステータスに移動
+    /// Move task to previous status (for plan revision)
     fn move_task_backward(&mut self) -> anyhow::Result<()> {
         if let Some(task) = self.selected_task_mut() {
-            let new_status = match task.status {
-                TaskStatus::Todo => return Ok(()),
-                TaskStatus::InProgress => TaskStatus::Todo,
-                TaskStatus::Review => TaskStatus::InProgress,
-                TaskStatus::Done => TaskStatus::Review,
-                TaskStatus::Cancelled => return Ok(()),
-            };
-            task.set_status(new_status);
-            self.store.save(&self.tasks)?;
-            self.status_message = Some(format!("Moved to {}", new_status.display_name()));
-            self.clamp_selection();
+            if let Some(new_status) = task.retreat_target() {
+                task.set_status(new_status);
+                self.store.save(&self.tasks)?;
+                self.status_message = Some(format!("Moved back to {}", new_status.display_name()));
+                self.clamp_selection();
+            }
         }
         Ok(())
     }
 
-    /// タスクを削除
+    /// Delete task (using TaskStore)
     fn delete_task(&mut self) -> anyhow::Result<()> {
         if let Some(task) = self.selected_task() {
             let id = task.id.clone();
-            // Worktree があれば削除
+            // Remove worktree if exists
             if task.worktree.is_some() {
                 let _ = self.worktree_manager.remove(&id);
             }
-            self.tasks.retain(|t| t.id != id);
-            self.store.save(&self.tasks)?;
+            self.store.delete(&id)?;
+            self.tasks = self.store.load()?;
             self.status_message = Some("Task deleted".into());
             self.clamp_selection();
         }
         Ok(())
     }
 
-    /// 入力を処理
+    /// Show task detail view
+    fn show_task_detail(&mut self) {
+        if self.selected_task().is_some() {
+            self.input_mode = InputMode::TaskDetail;
+            self.status_message = Some("Task Detail (ESC to close, s to stop agent, d for diff)".into());
+        } else {
+            self.status_message = Some("No task selected".into());
+        }
+    }
+
+    /// Stop running agent for selected task
+    fn stop_agent(&mut self) {
+        let task_id = match self.selected_task() {
+            Some(t) => t.id.clone(),
+            None => return,
+        };
+
+        let runner = Arc::clone(&self.agent_runner);
+        let event_tx = self.agent_event_tx.clone();
+
+        tokio::spawn(async move {
+            let mut runner = runner.lock().await;
+            if let Err(e) = runner.stop(&task_id).await {
+                let _ = event_tx
+                    .send(AgentEvent::Failed {
+                        task_id,
+                        error: format!("Failed to stop: {}", e),
+                    })
+                    .await;
+            }
+        });
+
+        self.status_message = Some("Stopping agent...".into());
+    }
+
+    /// Show diff view for selected task
+    fn show_diff(&mut self) -> anyhow::Result<()> {
+        if let Some(task) = self.selected_task() {
+            if task.worktree.is_some() {
+                // Check if worktree exists
+                if self.worktree_manager.exists(&task.id) {
+                    let diff = self.worktree_manager.get_diff(&task.id, "main")?;
+                    if diff.is_empty() {
+                        self.status_message = Some("No changes found".into());
+                    } else {
+                        self.diff_content = diff;
+                        self.diff_scroll = 0;
+                        self.input_mode = InputMode::ViewDiff;
+                        self.status_message = Some("Diff View (j/k scroll, ESC close)".into());
+                    }
+                } else {
+                    self.status_message = Some("Worktree not found".into());
+                }
+            } else {
+                self.status_message = Some("No worktree for this task".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Start merge confirmation
+    fn start_merge(&mut self) {
+        if let Some(task) = self.selected_task() {
+            if task.status == TaskStatus::Review {
+                // Validate implementation before merge
+                if let Some(ref worktree) = task.worktree {
+                    let validator = WorktreeValidator::new(PathBuf::from(worktree));
+                    let validation = validator.validate_implementation("main");
+
+                    match validation {
+                        Ok(result) => {
+                            if !result.is_valid {
+                                self.status_message = Some(format!("❌ {}", result.errors.join(", ")));
+                                return;
+                            }
+                            if !result.warnings.is_empty() {
+                                self.status_message = Some(format!("⚠️ {}", result.warnings.join(", ")));
+                            }
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Validation error: {}", e));
+                            return;
+                        }
+                    }
+                }
+
+                self.input_mode = InputMode::ConfirmMerge;
+                self.status_message = Some("Merge to main? (y/n)".into());
+            } else {
+                self.status_message = Some("Can only merge from Review status".into());
+            }
+        }
+    }
+
+    /// Execute merge
+    fn execute_merge(&mut self) -> anyhow::Result<()> {
+        if let Some(task) = self.selected_task() {
+            let task_id = task.id.clone();
+            let title = task.title.clone();
+
+            // Get changed file count for summary
+            let changed_files = if let Some(ref worktree) = task.worktree {
+                let validator = WorktreeValidator::new(PathBuf::from(worktree));
+                validator.changed_file_count("main").unwrap_or(0)
+            } else {
+                0
+            };
+
+            // Execute merge
+            self.worktree_manager.merge(&task_id, "main")?;
+
+            // Update task status
+            if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                task.set_status(TaskStatus::Done);
+            }
+            self.store.save(&self.tasks)?;
+
+            // Clean up worktree
+            let _ = self.worktree_manager.remove(&task_id);
+
+            self.input_mode = InputMode::Normal;
+            self.status_message = Some(format!(
+                "✅ Merged '{}' ({} files changed)",
+                title, changed_files
+            ));
+            self.clamp_selection();
+        }
+        Ok(())
+    }
+
+    /// Handle input
     fn handle_input(&mut self, c: char) {
         self.input_buffer.push(c);
     }
 
-    /// バックスペース
+    /// Handle backspace
     fn handle_backspace(&mut self) {
         self.input_buffer.pop();
     }
 
-    /// 入力確定
+    /// Confirm input
     fn confirm_input(&mut self) -> anyhow::Result<()> {
         match self.input_mode {
             InputMode::NewTaskTitle => {
@@ -278,45 +553,260 @@ impl App {
             }
             InputMode::NewTaskDescription => {
                 let task = Task::new(&self.pending_title, &self.input_buffer);
-                self.tasks.push(task);
-                self.store.save(&self.tasks)?;
+                self.store.add(task)?;
+                self.tasks = self.store.load()?;
                 self.input_mode = InputMode::Normal;
                 self.input_buffer.clear();
                 self.pending_title.clear();
                 self.status_message = Some("Task created!".into());
             }
-            InputMode::SelectAgent => {
-                self.assign_agent()?;
+            InputMode::SelectPlanner => {
+                self.assign_planner()?;
             }
-            InputMode::Normal => {}
+            InputMode::SelectExecutor => {
+                self.assign_executor()?;
+            }
+            InputMode::ConfirmMerge => {
+                // Enter confirms merge
+                self.execute_merge()?;
+            }
+            InputMode::Normal | InputMode::TaskDetail | InputMode::ViewDiff => {}
         }
         Ok(())
     }
 
-    /// 入力キャンセル
+    /// Cancel input / close popup
     fn cancel_input(&mut self) {
         self.input_mode = InputMode::Normal;
         self.input_buffer.clear();
         self.pending_title.clear();
+        self.diff_content.clear();
+        self.diff_scroll = 0;
         self.status_message = None;
     }
 
-    /// エージェント選択を上に移動
-    fn agent_up(&mut self) {
-        if self.selected_agent > 0 {
-            self.selected_agent -= 1;
+    /// Scroll diff view
+    fn scroll_diff(&mut self, direction: i32) {
+        let lines = self.diff_content.lines().count();
+        if direction > 0 && self.diff_scroll < lines.saturating_sub(20) {
+            self.diff_scroll += 1;
+        } else if direction < 0 && self.diff_scroll > 0 {
+            self.diff_scroll -= 1;
         }
     }
 
-    /// エージェント選択を下に移動
-    fn agent_down(&mut self) {
-        if self.selected_agent < self.agent_list.len() - 1 {
-            self.selected_agent += 1;
+    /// Move selection up
+    fn selection_up(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
         }
+    }
+
+    /// Move selection down
+    fn selection_down(&mut self) {
+        if self.selected_index < self.selection_list.len().saturating_sub(1) {
+            self.selected_index += 1;
+        }
+    }
+
+    /// Start agent in background
+    fn start_agent(
+        &self,
+        task_id: String,
+        agent_name: &str,
+        working_dir: PathBuf,
+        prompt: String,
+    ) {
+        let agent_runner = Arc::clone(&self.agent_runner);
+        let event_tx = self.agent_event_tx.clone();
+        let agent_name = agent_name.to_string();
+
+        tokio::spawn(async move {
+            // Get AgentConfig
+            let config = match agent::AgentConfig::from_name(&agent_name) {
+                Some(c) => c,
+                None => {
+                    let _ = event_tx
+                        .send(AgentEvent::Failed {
+                            task_id: task_id.clone(),
+                            error: format!("Unknown agent: {}", agent_name),
+                        })
+                        .await;
+                    return;
+                }
+            };
+
+            // Start agent
+            let rx = {
+                let mut runner = agent_runner.lock().await;
+                match runner.start(&task_id, config, working_dir, &prompt).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        let _ = event_tx
+                            .send(AgentEvent::Failed {
+                                task_id: task_id.clone(),
+                                error: e.to_string(),
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            };
+
+            // Forward output
+            let mut rx = rx;
+            while let Some(line) = rx.recv().await {
+                let _ = event_tx
+                    .send(AgentEvent::Output {
+                        task_id: task_id.clone(),
+                        line,
+                    })
+                    .await;
+            }
+
+            // Check completion
+            let status = {
+                let mut runner = agent_runner.lock().await;
+                runner.check_task_completion(&task_id)
+            };
+
+            if let Some(status) = status {
+                match status {
+                    AgentStatus::Completed => {
+                        let _ = event_tx
+                            .send(AgentEvent::Completed {
+                                task_id: task_id.clone(),
+                            })
+                            .await;
+                    }
+                    AgentStatus::Failed(error) => {
+                        let _ = event_tx
+                            .send(AgentEvent::Failed {
+                                task_id: task_id.clone(),
+                                error,
+                            })
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// Process agent events (non-blocking)
+    async fn process_agent_events(&mut self) -> anyhow::Result<()> {
+        while let Ok(event) = self.agent_event_rx.try_recv() {
+            match event {
+                AgentEvent::Completed { task_id } => {
+                    self.handle_agent_completed(&task_id)?;
+                }
+                AgentEvent::Failed { task_id, error } => {
+                    if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
+                        self.status_message =
+                            Some(format!("❌ Agent failed on '{}': {}", task.title, error));
+                    }
+                }
+                AgentEvent::Output { task_id, line } => {
+                    // Store last output line for the task
+                    if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
+                        // Update status message with last line (truncated)
+                        let truncated = if line.len() > 60 {
+                            format!("{}...", &line[..57])
+                        } else {
+                            line
+                        };
+                        self.status_message = Some(format!("📝 {}: {}", task.title, truncated));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle agent completion with artifact validation
+    fn handle_agent_completed(&mut self, task_id: &str) -> anyhow::Result<()> {
+        // Get task info first (immutable borrow)
+        let task_info = self.tasks.iter().find(|t| t.id == task_id).map(|t| {
+            (
+                t.status,
+                t.title.clone(),
+                t.worktree.clone(),
+            )
+        });
+
+        let Some((status, title, worktree)) = task_info else {
+            return Ok(());
+        };
+
+        match status {
+            TaskStatus::Planning => {
+                // Validate: Plan file must exist
+                if !self.plan_manager.plan_file_exists(task_id) {
+                    self.status_message = Some(format!(
+                        "⚠️ Planner finished but no plan file found for '{}'",
+                        title
+                    ));
+                    return Ok(());
+                }
+
+                // Plan file exists, advance to PlanReview
+                if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                    task.set_status(TaskStatus::PlanReview);
+                    self.store.save(&self.tasks)?;
+                    self.status_message = Some(format!("✅ Plan completed: {}", title));
+                }
+            }
+            TaskStatus::InProgress => {
+                // Validate: Changes or commits must exist
+                if let Some(worktree_path) = worktree {
+                    let validator = WorktreeValidator::new(PathBuf::from(&worktree_path));
+
+                    // Check for changes (commits or uncommitted)
+                    let has_commits = validator.has_new_commits("main").unwrap_or(false);
+                    let has_changes = validator.has_changes().unwrap_or(false);
+
+                    if !has_commits && !has_changes {
+                        self.status_message = Some(format!(
+                            "⚠️ Executor finished but no changes found for '{}'",
+                            title
+                        ));
+                        return Ok(());
+                    }
+
+                    // Changes exist, advance to Review
+                    if let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) {
+                        task.set_status(TaskStatus::Review);
+                        self.store.save(&self.tasks)?;
+
+                        let msg = if has_changes && !has_commits {
+                            format!("✅ Implementation completed (uncommitted): {}", title)
+                        } else {
+                            format!("✅ Implementation completed: {}", title)
+                        };
+                        self.status_message = Some(msg);
+                    }
+                } else {
+                    self.status_message = Some(format!(
+                        "⚠️ No worktree found for '{}'",
+                        title
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Update running agent count
+    async fn update_running_count(&mut self) {
+        let runner = self.agent_runner.lock().await;
+        self.running_count = runner.running_count();
     }
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -324,6 +814,11 @@ fn main() -> anyhow::Result<()> {
     let mut app = App::new()?;
 
     loop {
+        // Process agent events (non-blocking)
+        app.process_agent_events().await?;
+        // Update running count
+        app.update_running_count().await;
+
         terminal.draw(|frame| ui(frame, &app))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -338,12 +833,18 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char('j') | KeyCode::Down => app.move_down(),
                             KeyCode::Char('n') => app.start_new_task(),
                             KeyCode::Char('a') => app.start_assign_agent(),
+                            KeyCode::Enter => app.show_task_detail(),
+                            KeyCode::Char('d') => {
+                                app.show_diff()?;
+                            }
+                            KeyCode::Char('s') => app.stop_agent(),
                             KeyCode::Char('m') | KeyCode::Tab => {
                                 app.move_task_forward()?;
                             }
                             KeyCode::Char('M') | KeyCode::BackTab => {
                                 app.move_task_backward()?;
                             }
+                            KeyCode::Char('g') => app.start_merge(),
                             KeyCode::Char('x') | KeyCode::Delete => {
                                 app.delete_task()?;
                             }
@@ -356,11 +857,37 @@ fn main() -> anyhow::Result<()> {
                             KeyCode::Char(c) => app.handle_input(c),
                             _ => {}
                         },
-                        InputMode::SelectAgent => match key.code {
+                        InputMode::SelectPlanner | InputMode::SelectExecutor => match key.code {
                             KeyCode::Enter => app.confirm_input()?,
                             KeyCode::Esc => app.cancel_input(),
-                            KeyCode::Char('k') | KeyCode::Up => app.agent_up(),
-                            KeyCode::Char('j') | KeyCode::Down => app.agent_down(),
+                            KeyCode::Char('k') | KeyCode::Up => app.selection_up(),
+                            KeyCode::Char('j') | KeyCode::Down => app.selection_down(),
+                            _ => {}
+                        },
+                        InputMode::TaskDetail => match key.code {
+                            KeyCode::Esc | KeyCode::Enter => app.cancel_input(),
+                            KeyCode::Char('s') => {
+                                app.stop_agent();
+                                app.cancel_input();
+                            }
+                            KeyCode::Char('d') => {
+                                app.cancel_input();
+                                app.show_diff()?;
+                            }
+                            _ => {}
+                        },
+                        InputMode::ViewDiff => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => app.cancel_input(),
+                            KeyCode::Char('j') | KeyCode::Down => app.scroll_diff(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.scroll_diff(-1),
+                            KeyCode::Char(' ') | KeyCode::PageDown => {
+                                for _ in 0..10 { app.scroll_diff(1); }
+                            }
+                            _ => {}
+                        },
+                        InputMode::ConfirmMerge => match key.code {
+                            KeyCode::Char('y') | KeyCode::Enter => app.execute_merge()?,
+                            KeyCode::Char('n') | KeyCode::Esc => app.cancel_input(),
                             _ => {}
                         },
                     }
@@ -386,16 +913,21 @@ fn ui(frame: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    // ヘッダー
+    // Header
     let task_count = app.tasks.len();
-    let header_text = format!(" HIVE - AI Agent Kanban  ({} tasks) ", task_count);
+    let running_indicator = if app.running_count > 0 {
+        format!(" 🚀{} running ", app.running_count)
+    } else {
+        String::new()
+    };
+    let header_text = format!(" HIVE - AI Agent Kanban  ({} tasks){}", task_count, running_indicator);
     let header = Paragraph::new(header_text)
         .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::BOTTOM));
     frame.render_widget(header, main_layout[0]);
 
-    // カンバン
+    // Kanban
     let kanban_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -426,18 +958,24 @@ fn ui(frame: &mut Frame, app: &App) {
                 } else {
                     Style::default()
                 };
-                // エージェントが割り当てられていれば表示
-                let agent_icon = task
-                    .agent
-                    .as_ref()
-                    .map(|a| match a.as_str() {
+                // Status icon (sub-status display for Progress column)
+                let status_icon = task.status.icon();
+                // Planner/Executor icon
+                let agent_icon = if let Some(exec) = &task.executor {
+                    match exec.as_str() {
                         "claude" => " 🤖",
+                        _ => "",
+                    }
+                } else if let Some(planner) = &task.planner {
+                    match planner.as_str() {
                         "gemini" => " ✨",
                         "codex" => " 🔮",
                         _ => "",
-                    })
-                    .unwrap_or("");
-                ListItem::new(format!(" {}{} ", task.title, agent_icon)).style(style)
+                    }
+                } else {
+                    ""
+                };
+                ListItem::new(format!(" {} {}{}", status_icon, task.title, agent_icon)).style(style)
             })
             .collect();
 
@@ -457,12 +995,12 @@ fn ui(frame: &mut Frame, app: &App) {
         frame.render_widget(list, *col_area);
     }
 
-    // フッター
+    // Footer
     let footer_text = match &app.input_mode {
         InputMode::Normal => app
             .status_message
             .as_deref()
-            .unwrap_or(" [h/l] move  [j/k] select  [n]ew  [a]ssign  [m]ove→  [x]delete  [q]uit "),
+            .unwrap_or(" [h/l]←→ [j/k]↑↓ [n]ew [a]ssign [Enter]detail [d]iff [s]top [m]ove [g]merge [x]del [q]uit "),
         _ => app.status_message.as_deref().unwrap_or(""),
     };
     let footer = Paragraph::new(footer_text)
@@ -471,7 +1009,7 @@ fn ui(frame: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::TOP));
     frame.render_widget(footer, main_layout[2]);
 
-    // 入力モードならポップアップを表示
+    // Show popup in input mode
     match app.input_mode {
         InputMode::NewTaskTitle | InputMode::NewTaskDescription => {
             let popup_area = centered_rect(50, 20, area);
@@ -493,43 +1031,178 @@ fn ui(frame: &mut Frame, app: &App) {
                 );
             frame.render_widget(input, popup_area);
         }
-        InputMode::SelectAgent => {
-            let popup_area = centered_rect(40, 30, area);
+        InputMode::SelectPlanner | InputMode::SelectExecutor => {
+            let popup_area = centered_rect(50, 35, area);
             frame.render_widget(Clear, popup_area);
 
+            let (title, color) = match app.input_mode {
+                InputMode::SelectPlanner => ("🧠 Select Planner", Color::Yellow),
+                InputMode::SelectExecutor => ("🔨 Select Executor", Color::Cyan),
+                _ => ("Select", Color::White),
+            };
+
             let items: Vec<ListItem> = app
-                .agent_list
+                .selection_list
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
-                    let icon = match *name {
-                        "claude" => "🤖",
-                        "gemini" => "✨",
-                        "codex" => "🔮",
-                        _ => "•",
+                    let (icon, desc) = match name.as_str() {
+                        "gemini" => ("✨", "Fast & cheap. For general tasks"),
+                        "codex" => ("🔮", "Strong reasoning. For complex design"),
+                        "claude" => ("🤖", "High code quality. Best for impl"),
+                        _ => ("•", ""),
                     };
-                    let style = if i == app.selected_agent {
-                        Style::default().bg(Color::Cyan).fg(Color::Black)
+                    let style = if i == app.selected_index {
+                        Style::default().bg(color).fg(Color::Black)
                     } else {
                         Style::default()
                     };
-                    ListItem::new(format!(" {} {} ", icon, name)).style(style)
+                    ListItem::new(format!(" {} {} - {}", icon, name, desc)).style(style)
                 })
                 .collect();
 
             let list = List::new(items).block(
                 Block::default()
-                    .title("Select Agent")
+                    .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(color)),
             );
             frame.render_widget(list, popup_area);
+        }
+        InputMode::TaskDetail => {
+            if let Some(task) = app.selected_task() {
+                let popup_area = centered_rect(60, 50, area);
+                frame.render_widget(Clear, popup_area);
+
+                let mut lines: Vec<Line> = vec![];
+                lines.push(Line::from(vec![
+                    Span::styled("Title: ", Style::default().fg(Color::Gray)),
+                    Span::styled(&task.title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Status: ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{} {}", task.status.icon(), task.status.display_name()), Style::default().fg(Color::Cyan)),
+                ]));
+                if !task.description.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Description: ", Style::default().fg(Color::Gray)),
+                        Span::styled(&task.description, Style::default().fg(Color::White)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                if let Some(planner) = &task.planner {
+                    lines.push(Line::from(vec![
+                        Span::styled("Planner: ", Style::default().fg(Color::Gray)),
+                        Span::styled(format!("✨ {}", planner), Style::default().fg(Color::Yellow)),
+                    ]));
+                }
+                if let Some(executor) = &task.executor {
+                    lines.push(Line::from(vec![
+                        Span::styled("Executor: ", Style::default().fg(Color::Gray)),
+                        Span::styled(format!("🤖 {}", executor), Style::default().fg(Color::Green)),
+                    ]));
+                }
+                if let Some(branch) = &task.branch {
+                    lines.push(Line::from(vec![
+                        Span::styled("Branch: ", Style::default().fg(Color::Gray)),
+                        Span::styled(branch, Style::default().fg(Color::Magenta)),
+                    ]));
+                }
+                if let Some(worktree) = &task.worktree {
+                    lines.push(Line::from(vec![
+                        Span::styled("Worktree: ", Style::default().fg(Color::Gray)),
+                        Span::styled(worktree, Style::default().fg(Color::Blue)),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("ID: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&task.id, Style::default().fg(Color::DarkGray)),
+                ]));
+
+                let detail = Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .title("📋 Task Detail")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Cyan)),
+                    );
+                frame.render_widget(detail, popup_area);
+            }
+        }
+        InputMode::ViewDiff => {
+            let popup_area = centered_rect(80, 80, area);
+            frame.render_widget(Clear, popup_area);
+
+            let lines: Vec<Line> = app.diff_content
+                .lines()
+                .skip(app.diff_scroll)
+                .take(popup_area.height as usize - 2)
+                .map(|line| {
+                    let style = if line.starts_with('+') && !line.starts_with("+++") {
+                        Style::default().fg(Color::Green)
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        Style::default().fg(Color::Red)
+                    } else if line.starts_with("@@") {
+                        Style::default().fg(Color::Cyan)
+                    } else if line.starts_with("diff") || line.starts_with("index") {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    Line::styled(line, style)
+                })
+                .collect();
+
+            let total_lines = app.diff_content.lines().count();
+            let title = format!("📄 Diff ({}/{} lines) [j/k scroll, ESC close]", app.diff_scroll + 1, total_lines);
+
+            let diff_view = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow)),
+                );
+            frame.render_widget(diff_view, popup_area);
+        }
+        InputMode::ConfirmMerge => {
+            if let Some(task) = app.selected_task() {
+                let popup_area = centered_rect(50, 25, area);
+                frame.render_widget(Clear, popup_area);
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Merge ", Style::default().fg(Color::White)),
+                        Span::styled(&task.title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        Span::styled(" to main?", Style::default().fg(Color::White)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Branch: ", Style::default().fg(Color::Gray)),
+                        Span::styled(task.branch.as_deref().unwrap_or("unknown"), Style::default().fg(Color::Magenta)),
+                    ]),
+                    Line::from(""),
+                    Line::styled("[y] Yes  [n] No", Style::default().fg(Color::Yellow)),
+                ];
+
+                let confirm = Paragraph::new(lines)
+                    .alignment(Alignment::Center)
+                    .block(
+                        Block::default()
+                            .title("🔀 Confirm Merge")
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::Yellow)),
+                    );
+                frame.render_widget(confirm, popup_area);
+            }
         }
         InputMode::Normal => {}
     }
 }
 
-/// 中央寄せの矩形を計算
+/// Calculate centered rectangle
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)

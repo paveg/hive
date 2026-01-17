@@ -3,13 +3,13 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// git worktree を管理
+/// Git worktree manager
 pub struct WorktreeManager {
-    /// リポジトリのルートパス
+    /// Repository root path
     repo_root: PathBuf,
-    /// worktree を作成するディレクトリ
+    /// Directory for creating worktrees
     worktree_dir: PathBuf,
-    /// ブランチのプレフィックス
+    /// Branch name prefix
     branch_prefix: String,
 }
 
@@ -25,17 +25,17 @@ impl WorktreeManager {
         }
     }
 
-    /// タスク用の worktree を作成
+    /// Create worktree for a task
     pub fn create(&self, task_id: &str) -> Result<PathBuf> {
         let branch_name = format!("{}/{}", self.branch_prefix, task_id);
         let worktree_path = self.worktree_dir.join(task_id);
 
-        // すでに存在する場合はそのまま返す
+        // Return existing path if already exists
         if worktree_path.exists() {
             return Ok(worktree_path);
         }
 
-        // 新しいブランチで worktree を作成
+        // Create worktree with a new branch
         let output = Command::new("git")
             .args(["worktree", "add", "-b", &branch_name])
             .arg(&worktree_path)
@@ -45,7 +45,7 @@ impl WorktreeManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // ブランチが既に存在する場合は、既存ブランチで作成を試みる
+            // If branch already exists, try to create with existing branch
             if stderr.contains("already exists") {
                 let output = Command::new("git")
                     .args(["worktree", "add"])
@@ -66,13 +66,13 @@ impl WorktreeManager {
             }
         }
 
-        // .claude/settings.json を設定（plansDirectory）
+        // Set up .claude/settings.json (plansDirectory)
         self.setup_claude_settings(&worktree_path)?;
 
         Ok(worktree_path)
     }
 
-    /// worktree を削除
+    /// Remove worktree
     pub fn remove(&self, task_id: &str) -> Result<()> {
         let worktree_path = self.worktree_dir.join(task_id);
 
@@ -80,7 +80,7 @@ impl WorktreeManager {
             return Ok(());
         }
 
-        // worktree を削除
+        // Remove worktree
         let output = Command::new("git")
             .args(["worktree", "remove", "--force"])
             .arg(&worktree_path)
@@ -98,27 +98,28 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// worktree のパスを取得
+    /// Get worktree path
+    #[allow(dead_code)]
     pub fn get_path(&self, task_id: &str) -> PathBuf {
         self.worktree_dir.join(task_id)
     }
 
-    /// worktree が存在するか確認
+    /// Check if worktree exists
     pub fn exists(&self, task_id: &str) -> bool {
         self.worktree_dir.join(task_id).exists()
     }
 
-    /// ブランチ名を取得
+    /// Get branch name
     pub fn get_branch_name(&self, task_id: &str) -> String {
         format!("{}/{}", self.branch_prefix, task_id)
     }
 
-    /// Claude Code の設定ファイルを作成
+    /// Create Claude Code settings file
     fn setup_claude_settings(&self, worktree_path: &PathBuf) -> Result<()> {
         let claude_dir = worktree_path.join(".claude");
         std::fs::create_dir_all(&claude_dir).context("Failed to create .claude directory")?;
 
-        // plansDirectory を .hive/plans に向ける（相対パス）
+        // Point plansDirectory to .hive/plans (relative path)
         let settings = serde_json::json!({
             "plansDirectory": "../../plans"
         });
@@ -133,7 +134,7 @@ impl WorktreeManager {
         Ok(())
     }
 
-    /// メインブランチとの差分を取得
+    /// Get diff from main branch
     pub fn get_diff(&self, task_id: &str, base_branch: &str) -> Result<String> {
         let worktree_path = self.worktree_dir.join(task_id);
 
@@ -146,11 +147,11 @@ impl WorktreeManager {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    /// 変更をマージ
-    pub fn merge(&self, task_id: &str, target_branch: &str) -> Result<()> {
+    /// Merge changes
+    pub fn merge(&self, task_id: &str, _target_branch: &str) -> Result<()> {
         let branch_name = self.get_branch_name(task_id);
 
-        // メインリポジトリでマージ
+        // Merge in main repository
         let output = Command::new("git")
             .args(["merge", &branch_name, "--no-ff", "-m"])
             .arg(format!("Merge {} via Hive", task_id))
@@ -166,5 +167,87 @@ impl WorktreeManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_manager() -> (TempDir, WorktreeManager) {
+        let temp_dir = TempDir::new().unwrap();
+        let hive_dir = temp_dir.path().join(".hive");
+        let manager = WorktreeManager::new(temp_dir.path().to_path_buf(), hive_dir);
+        (temp_dir, manager)
+    }
+
+    // ========================================
+    // Branch Name Generation Tests
+    // ========================================
+
+    #[test]
+    fn test_get_branch_name() {
+        let (_temp, manager) = create_test_manager();
+
+        let branch = manager.get_branch_name("task-abc123");
+        assert_eq!(branch, "hive/task-abc123");
+    }
+
+    #[test]
+    fn test_get_branch_name_various_ids() {
+        let (_temp, manager) = create_test_manager();
+
+        assert_eq!(manager.get_branch_name("task-1"), "hive/task-1");
+        assert_eq!(manager.get_branch_name("feature-xyz"), "hive/feature-xyz");
+        assert_eq!(manager.get_branch_name("123"), "hive/123");
+    }
+
+    // ========================================
+    // Path Generation Tests
+    // ========================================
+
+    #[test]
+    fn test_get_path() {
+        let (temp_dir, manager) = create_test_manager();
+
+        let path = manager.get_path("task-abc123");
+        let expected = temp_dir.path().join(".hive/worktrees/task-abc123");
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn test_worktrees_dir_created() {
+        let (temp_dir, _manager) = create_test_manager();
+
+        let worktrees_dir = temp_dir.path().join(".hive/worktrees");
+        assert!(worktrees_dir.exists());
+    }
+
+    // ========================================
+    // Exists Check Tests
+    // ========================================
+
+    #[test]
+    fn test_exists_false_when_not_created() {
+        let (_temp, manager) = create_test_manager();
+
+        assert!(!manager.exists("nonexistent-task"));
+    }
+
+    // ========================================
+    // Edge Cases
+    // ========================================
+
+    #[test]
+    fn test_special_characters_in_task_id() {
+        let (_temp, manager) = create_test_manager();
+
+        // These should work as branch names
+        let branch = manager.get_branch_name("task-with-dashes");
+        assert_eq!(branch, "hive/task-with-dashes");
+
+        let branch = manager.get_branch_name("task_with_underscores");
+        assert_eq!(branch, "hive/task_with_underscores");
     }
 }
