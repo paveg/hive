@@ -510,6 +510,71 @@ impl App {
         Ok(())
     }
 
+    /// Create PR for selected task
+    fn create_pr(&mut self) -> anyhow::Result<()> {
+        let task = match self.selected_task() {
+            Some(t) => t,
+            None => {
+                self.status_message = Some("No task selected".into());
+                return Ok(());
+            }
+        };
+
+        if task.status != TaskStatus::Review {
+            self.status_message = Some("Task must be in Review status to create PR".into());
+            return Ok(());
+        }
+
+        let branch = match &task.branch {
+            Some(b) => b.clone(),
+            None => {
+                self.status_message = Some("No branch for this task".into());
+                return Ok(());
+            }
+        };
+
+        let worktree = match &task.worktree {
+            Some(w) => w.clone(),
+            None => {
+                self.status_message = Some("No worktree for this task".into());
+                return Ok(());
+            }
+        };
+
+        let title = task.title.clone();
+        let description = task.description.clone();
+
+        // Create PR using gh command
+        self.status_message = Some(format!("Creating PR for '{}'...", title));
+
+        let pr_body = format!(
+            "## Summary\n{}\n\n## Task\nCreated via Hive AI Agent Orchestration\n\n---\n🤖 Generated with Hive",
+            if description.is_empty() { &title } else { &description }
+        );
+
+        let output = std::process::Command::new("gh")
+            .args(["pr", "create", "--title", &title, "--body", &pr_body, "--head", &branch])
+            .current_dir(&worktree)
+            .output();
+
+        match output {
+            Ok(result) => {
+                if result.status.success() {
+                    let url = String::from_utf8_lossy(&result.stdout).trim().to_string();
+                    self.status_message = Some(format!("✅ PR created: {}", url));
+                } else {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    self.status_message = Some(format!("❌ PR failed: {}", stderr.trim()));
+                }
+            }
+            Err(e) => {
+                self.status_message = Some(format!("❌ Failed to run gh: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Start merge confirmation
     fn start_merge(&mut self) {
         if let Some(task) = self.selected_task() {
@@ -942,6 +1007,9 @@ async fn main() -> anyhow::Result<()> {
                                 app.move_task_backward()?;
                             }
                             KeyCode::Char('g') => app.start_merge(),
+                            KeyCode::Char('p') => {
+                                app.create_pr()?;
+                            }
                             KeyCode::Char('x') | KeyCode::Delete => {
                                 app.delete_task()?;
                             }
@@ -1126,7 +1194,7 @@ fn ui(frame: &mut Frame, app: &App) {
         InputMode::Normal => app
             .status_message
             .as_deref()
-            .unwrap_or(" [h/l]←→ [j/k]↑↓ [n]ew [a]ssign [Enter]detail [d]iff [s]top [m]ove [g]merge [x]del [q]uit "),
+            .unwrap_or(" [n]ew [a]ssign [d]iff [p]r [m]ove [g]merge [s]top [x]del [q]uit "),
         _ => app.status_message.as_deref().unwrap_or(""),
     };
     let footer = Paragraph::new(footer_text)
