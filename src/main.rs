@@ -52,6 +52,10 @@ enum InputMode {
     ViewDiff,
     /// Confirming merge
     ConfirmMerge,
+    /// Showing help
+    Help,
+    /// Settings screen
+    Settings,
 }
 
 /// Log entry for agent output
@@ -106,6 +110,8 @@ struct App {
     agent_logs: std::collections::VecDeque<LogEntry>,
     /// Spinner animation frame
     spinner_frame: usize,
+    /// Settings focus: 0 = planner, 1 = executor
+    settings_focus: usize,
 }
 
 /// Spinner animation frames
@@ -147,6 +153,7 @@ impl App {
             running_count: 0,
             agent_logs: std::collections::VecDeque::with_capacity(100),
             spinner_frame: 0,
+            settings_focus: 0,
         })
     }
 
@@ -466,6 +473,46 @@ impl App {
         }
     }
 
+    /// Open settings screen
+    fn open_settings(&mut self) {
+        self.settings_focus = 0;
+        self.selection_list = self.orchestrator.available_planners()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        self.selected_index = self.selection_list
+            .iter()
+            .position(|s| s == &self.orchestrator.default_planner)
+            .unwrap_or(0);
+        self.input_mode = InputMode::Settings;
+        self.status_message = Some("Settings (Tab: switch field, Enter: select, ESC: close)".into());
+    }
+
+    /// Save orchestrator config to file
+    fn save_orchestrator_config(&self) -> anyhow::Result<()> {
+        let hive_dir = PathBuf::from(".hive");
+        let config_path = hive_dir.join("config.json");
+
+        // Load existing config or create new
+        let mut config: serde_json::Value = if config_path.exists() {
+            let content = std::fs::read_to_string(&config_path)?;
+            serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
+        // Update orchestrator section
+        config["orchestrator"] = serde_json::json!({
+            "default_planner": self.orchestrator.default_planner,
+            "default_executor": self.orchestrator.default_executor,
+            "planners": self.orchestrator.planners,
+            "executors": self.orchestrator.executors,
+        });
+
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+        Ok(())
+    }
+
     /// Stop running agent for selected task
     fn stop_agent(&mut self) {
         let task_id = match self.selected_task() {
@@ -732,7 +779,7 @@ impl App {
                 // Enter confirms merge
                 self.execute_merge()?;
             }
-            InputMode::Normal | InputMode::TaskDetail | InputMode::ViewDiff => {}
+            InputMode::Normal | InputMode::TaskDetail | InputMode::ViewDiff | InputMode::Help | InputMode::Settings => {}
         }
         Ok(())
     }
@@ -1079,21 +1126,26 @@ async fn main() -> anyhow::Result<()> {
                             KeyCode::Char('x') | KeyCode::Delete => {
                                 app.delete_task()?;
                             }
+                            KeyCode::Char('?') => {
+                                app.input_mode = InputMode::Help;
+                            }
+                            KeyCode::Char('S') => {
+                                app.open_settings();
+                            }
                             _ => {}
                         },
                         InputMode::NewTaskTitle | InputMode::NewTaskDescription => match key.code {
-                            KeyCode::Enter => {
-                                if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-                                    // Ctrl+Enter: insert newline
-                                    app.input_buffer.push('\n');
-                                } else {
-                                    // Enter: confirm
-                                    app.confirm_input()?;
-                                }
-                            }
+                            KeyCode::Enter => app.confirm_input()?,
                             KeyCode::Esc => app.cancel_input(),
                             KeyCode::Backspace => app.handle_backspace(),
-                            KeyCode::Char(c) => app.handle_input(c),
+                            KeyCode::Char('j') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                // Ctrl+J: insert newline (same as Claude Code)
+                                app.input_buffer.push('\n');
+                            }
+                            KeyCode::Char(c) if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                // Only handle chars without Ctrl modifier
+                                app.handle_input(c);
+                            }
                             _ => {}
                         },
                         InputMode::SelectPlanner | InputMode::SelectExecutor => match key.code {
@@ -1127,6 +1179,74 @@ async fn main() -> anyhow::Result<()> {
                         InputMode::ConfirmMerge => match key.code {
                             KeyCode::Char('y') | KeyCode::Enter => app.execute_merge()?,
                             KeyCode::Char('n') | KeyCode::Esc => app.cancel_input(),
+                            _ => {}
+                        },
+                        InputMode::Help => match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+                                app.input_mode = InputMode::Normal;
+                            }
+                            _ => {}
+                        },
+                        InputMode::Settings => match key.code {
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                                app.status_message = Some("Settings closed".into());
+                            }
+                            KeyCode::Tab => {
+                                // Switch between planner (0) and executor (1)
+                                app.settings_focus = (app.settings_focus + 1) % 2;
+                                if app.settings_focus == 0 {
+                                    app.selection_list = app.orchestrator.available_planners()
+                                        .into_iter()
+                                        .map(|s| s.to_string())
+                                        .collect();
+                                    app.selected_index = app.selection_list
+                                        .iter()
+                                        .position(|s| s == &app.orchestrator.default_planner)
+                                        .unwrap_or(0);
+                                } else {
+                                    app.selection_list = app.orchestrator.available_executors()
+                                        .into_iter()
+                                        .map(|s| s.to_string())
+                                        .collect();
+                                    app.selected_index = app.selection_list
+                                        .iter()
+                                        .position(|s| s == &app.orchestrator.default_executor)
+                                        .unwrap_or(0);
+                                }
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if !app.selection_list.is_empty() {
+                                    app.selected_index = (app.selected_index + 1) % app.selection_list.len();
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                if !app.selection_list.is_empty() {
+                                    app.selected_index = app.selected_index
+                                        .checked_sub(1)
+                                        .unwrap_or(app.selection_list.len() - 1);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                // Set selected value
+                                if let Some(selected) = app.selection_list.get(app.selected_index) {
+                                    if app.settings_focus == 0 {
+                                        app.orchestrator.default_planner = selected.clone();
+                                    } else {
+                                        app.orchestrator.default_executor = selected.clone();
+                                    }
+                                    // Save to config file
+                                    if let Err(e) = app.save_orchestrator_config() {
+                                        app.status_message = Some(format!("❌ Failed to save: {}", e));
+                                    } else {
+                                        app.status_message = Some(format!(
+                                            "✅ {} set to '{}'",
+                                            if app.settings_focus == 0 { "Default planner" } else { "Default executor" },
+                                            selected
+                                        ));
+                                    }
+                                }
+                            }
                             _ => {}
                         },
                     }
@@ -1297,11 +1417,11 @@ fn ui(frame: &mut Frame, app: &App) {
             let (title, help) = match app.input_mode {
                 InputMode::NewTaskTitle => (
                     "New Task - Title",
-                    " Enter: confirm | Ctrl+Enter: newline | ESC: cancel ",
+                    " Enter: confirm | Ctrl+J: newline | ESC: cancel ",
                 ),
                 InputMode::NewTaskDescription => (
                     "New Task - Description",
-                    " Enter: confirm (skip if empty) | Ctrl+Enter: newline | ESC: cancel ",
+                    " Enter: confirm (skip if empty) | Ctrl+J: newline | ESC: cancel ",
                 ),
                 _ => ("", ""),
             };
@@ -1500,6 +1620,109 @@ fn ui(frame: &mut Frame, app: &App) {
                     );
                 frame.render_widget(confirm, popup_area);
             }
+        }
+        InputMode::Help => {
+            let popup_area = centered_rect(60, 70, area);
+            frame.render_widget(Clear, popup_area);
+
+            let help_lines = vec![
+                Line::from(""),
+                Line::styled("  Navigation", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Line::from("  h/←  Move left       l/→  Move right"),
+                Line::from("  j/↓  Move down       k/↑  Move up"),
+                Line::from(""),
+                Line::styled("  Task Management", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Line::from("  n    New task        a    Assign agent"),
+                Line::from("  m/Tab  Move forward  M/S-Tab  Move back"),
+                Line::from("  x/Del  Delete task   Enter  Task detail"),
+                Line::from(""),
+                Line::styled("  Agents & Git", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Line::from("  s    Stop agent      d    Show diff"),
+                Line::from("  p    Create PR       g    Merge to main"),
+                Line::from(""),
+                Line::styled("  Other", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Line::from("  S    Settings        ?    Show this help"),
+                Line::from("  q    Quit"),
+                Line::from(""),
+                Line::styled("  Press ESC or ? to close", Style::default().fg(Color::DarkGray)),
+            ];
+
+            let help = Paragraph::new(help_lines)
+                .block(
+                    Block::default()
+                        .title("❓ Help - Keybindings")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
+            frame.render_widget(help, popup_area);
+        }
+        InputMode::Settings => {
+            let popup_area = centered_rect(50, 50, area);
+            frame.render_widget(Clear, popup_area);
+
+            let mut lines: Vec<Line> = vec![
+                Line::from(""),
+                Line::styled("  Default Planner", Style::default()
+                    .fg(if app.settings_focus == 0 { Color::Cyan } else { Color::Gray })
+                    .add_modifier(if app.settings_focus == 0 { Modifier::BOLD } else { Modifier::empty() })),
+            ];
+
+            // Show planner options if focused
+            if app.settings_focus == 0 {
+                for (i, planner) in app.selection_list.iter().enumerate() {
+                    let is_current = planner == &app.orchestrator.default_planner;
+                    let is_selected = i == app.selected_index;
+                    let prefix = if is_selected { "  → " } else { "    " };
+                    let suffix = if is_current { " ✓" } else { "" };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(Color::Yellow)),
+                        Span::styled(planner, Style::default().fg(if is_selected { Color::Yellow } else { Color::White })),
+                        Span::styled(suffix, Style::default().fg(Color::Green)),
+                    ]));
+                }
+            } else {
+                lines.push(Line::styled(
+                    format!("    Current: {}", app.orchestrator.default_planner),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::styled("  Default Executor", Style::default()
+                .fg(if app.settings_focus == 1 { Color::Cyan } else { Color::Gray })
+                .add_modifier(if app.settings_focus == 1 { Modifier::BOLD } else { Modifier::empty() })));
+
+            // Show executor options if focused
+            if app.settings_focus == 1 {
+                for (i, executor) in app.selection_list.iter().enumerate() {
+                    let is_current = executor == &app.orchestrator.default_executor;
+                    let is_selected = i == app.selected_index;
+                    let prefix = if is_selected { "  → " } else { "    " };
+                    let suffix = if is_current { " ✓" } else { "" };
+                    lines.push(Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(Color::Yellow)),
+                        Span::styled(executor, Style::default().fg(if is_selected { Color::Yellow } else { Color::White })),
+                        Span::styled(suffix, Style::default().fg(Color::Green)),
+                    ]));
+                }
+            } else {
+                lines.push(Line::styled(
+                    format!("    Current: {}", app.orchestrator.default_executor),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::styled("  Tab: switch | j/k: select | Enter: save | ESC: close", Style::default().fg(Color::DarkGray)));
+
+            let settings = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title("⚙️  Settings")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Magenta)),
+                );
+            frame.render_widget(settings, popup_area);
         }
         InputMode::Normal => {}
     }
