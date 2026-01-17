@@ -272,8 +272,10 @@ impl App {
         self.store.save(&self.tasks)?;
         self.input_mode = InputMode::Normal;
 
-        // Create planning prompt
-        let prompt = self.plan_manager.create_planning_prompt(&task_title, &task_description);
+        // Create planning prompt with plan file path
+        let prompt = self
+            .plan_manager
+            .create_planning_prompt(&task_id, &task_title, &task_description);
 
         // Start agent in background
         self.start_agent(

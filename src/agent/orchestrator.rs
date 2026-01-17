@@ -155,7 +155,13 @@ impl PlanManager {
     }
 
     /// Create planning prompt
-    pub fn create_planning_prompt(&self, task_title: &str, task_description: &str) -> String {
+    pub fn create_planning_prompt(
+        &self,
+        task_id: &str,
+        task_title: &str,
+        task_description: &str,
+    ) -> String {
+        let plan_file = format!("../../plans/{}.md", task_id);
         format!(
             r#"Please create an implementation plan for the following task.
 
@@ -163,8 +169,13 @@ impl PlanManager {
 **Title**: {}
 **Description**: {}
 
+## Instructions
+1. Analyze the codebase to understand the current structure
+2. Create a detailed implementation plan
+3. **IMPORTANT**: Save the plan to the file: `{}`
+
 ## Output Format
-Please output in Markdown format as follows:
+Save the plan in Markdown format as follows:
 
 ```markdown
 # Implementation Plan: [Task Title]
@@ -191,8 +202,10 @@ Please output in Markdown format as follows:
 ## Notes and Risks
 - [Note 1]
 ```
+
+Remember: You MUST write the plan to `{}` for the workflow to continue.
 "#,
-            task_title, task_description
+            task_title, task_description, plan_file, plan_file
         )
     }
 
@@ -402,7 +415,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = PlanManager::new(temp_dir.path().to_path_buf());
 
-        let prompt = manager.create_planning_prompt("Add login feature", "Implement OAuth login");
+        let prompt =
+            manager.create_planning_prompt("task-123", "Add login feature", "Implement OAuth login");
 
         assert!(prompt.contains("Add login feature"));
         assert!(prompt.contains("Implement OAuth login"));
@@ -411,6 +425,8 @@ mod tests {
         assert!(prompt.contains("## Implementation Steps"));
         assert!(prompt.contains("## Scope of Impact"));
         assert!(prompt.contains("## Test Strategy"));
+        // Verify plan file path is included
+        assert!(prompt.contains("../../plans/task-123.md"));
     }
 
     #[test]
