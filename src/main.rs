@@ -740,9 +740,9 @@ impl App {
                 AgentEvent::Output { task_id, line } => {
                     // Store last output line for the task
                     if let Some(task) = self.tasks.iter().find(|t| t.id == task_id) {
-                        // Update status message with last line (truncated)
-                        let truncated = if line.len() > 60 {
-                            format!("{}...", &line[..57])
+                        // Update status message with last line (truncated safely for UTF-8)
+                        let truncated = if line.chars().count() > 60 {
+                            format!("{}...", line.chars().take(57).collect::<String>())
                         } else {
                             line
                         };
